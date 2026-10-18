@@ -1,735 +1,455 @@
-/* 族譜 — Vanilla HTML/CSS/JS
-   資料儲存在 localStorage，預設載入範例（張氏家族）。
-   支援 GEDCOM 5.5.1 匯入匯出。
-*/
+#!/usr/bin/env node
+/* zu-pu v1 — life-path genealogy with 9-language i18n, SVG portraits, Lab mode */
+'use strict';
 
-const $ = (s, r=document) => r.querySelector(s);
-const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
-const STORAGE_KEY = 'zu-pu-v1';
+const CACHE = { i18n: null };
+let I18N = {}, LANG = 'zh-Hant';
 
-let DB = { _meta: { source: 'demo', version: 1, title: '族譜' }, people: {} };
+const SUPPORTED_LANGS = ['zh-Hant','zh-Hans','en','ko','ja','vi','fr','th','es'];
+
+const $  = (s, el=document) => el.querySelector(s);
+const $$ = (s, el=document) => Array.from(el.querySelectorAll(s));
+
+function detectLang() {
+  const saved = localStorage.getItem('zu-pu.lang');
+  if (saved && SUPPORTED_LANGS.includes(saved)) return saved;
+  const nav = (navigator.language || 'en').toLowerCase();
+  if (nav.startsWith('zh'))  return nav.includes('hans') || nav.includes('cn') ? 'zh-Hans' : 'zh-Hant';
+  if (nav.startsWith('en'))  return 'en';
+  if (nav.startsWith('ko'))  return 'ko';
+  if (nav.startsWith('ja'))  return 'ja';
+  if (nav.startsWith('vi'))  return 'vi';
+  if (nav.startsWith('fr'))  return 'fr';
+  if (nav.startsWith('th'))  return 'th';
+  if (nav.startsWith('es'))  return 'es';
+  return 'en';
+}
+
+function t(key, ...vals) {
+  const dict = I18N[LANG] || I18N['en'] || {};
+  let s = dict[key];
+  if (s == null) s = (I18N['en'] || {})[key] || key;
+  vals.forEach((v, i) => { s = s.replace(new RegExp('\\{'+i+'\\}','g'), v); });
+  return s;
+}
+
+async function loadI18n() {
+  if (CACHE.i18n) { I18N = CACHE.i18n; return; }
+  try {
+    const res = await fetch('data/i18n.json');
+    I18N = await res.json();
+    CACHE.i18n = I18N;
+  } catch (e) { I18N = { en: {} }; }
+}
+
+function setLang(lang) {
+  if (!SUPPORTED_LANGS.includes(lang)) return;
+  LANG = lang;
+  localStorage.setItem('zu-pu.lang', lang);
+  renderAll();
+}
+
+/* ===== Data Model ===== */
 let STATE = {
-  view: 'tree',
-  tree: { rootId: null, mode: 'ancestor', gen: 3 },
-  selectedId: null,
-  ioMessage: '',
+  people: [],
+  families: [],
+  meta: { root: null, name: '' }
 };
 
-const fmtDate = (d) => {
-  if (!d) return '';
-  const y = d.year || '?';
-  const m = d.month ? String(d.month).padStart(2, '0') : '';
-  const day = d.day ? String(d.day).padStart(2, '0') : '';
-  if (m && day) return `${y}-${m}-${day}`;
-  if (m) return `${y}-${m}`;
-  return `${y}`;
-};
-const fmtDateRange = (p) => {
-  const b = fmtDate(p.birth), d = fmtDate(p.death);
-  if (b && d) return `${b} → ${d}`;
-  if (b) return `${b} →`;
-  if (d) return `→ ${d}`;
-  return '—';
-};
-const ageAt = (p) => {
-  if (!p.birth || !p.birth.year) return null;
-  const end = (p.death && p.death.year) || new Date().getFullYear();
-  return end - p.birth.year;
-};
-const isAlive = (p) => !p.death || !p.death.year;
-const isMale = (p) => p.gender === 'M';
-const isFemale = (p) => p.gender === 'F';
-const isUnknown = (p) => p.gender === 'U' || !p.gender;
-const person = (id) => DB.people[id] || null;
-const allIds = () => Object.keys(DB.people);
+const SEX = { M: 'M', F: 'F', U: 'U' };
 
-/* 衍生關係 */
-function getParents(id) {
-  const p = person(id);
-  if (!p) return [];
-  return (p.parents || []).map(person).filter(Boolean);
+function personById(id) { return STATE.people.find(p => p.id === id); }
+function familyById(id) { return STATE.families.find(f => f.id === id); }
+function familiesOf(p) {
+  return STATE.families.filter(f => (f.husb === p.id || f.wife === p.id));
 }
-function getFather(id) {
-  const ps = getParents(id);
-  return ps.find(isMale) || ps[0] || null;
+function parentsOf(p) {
+  const fam = STATE.families.find(f => f.children && f.children.includes(p.id));
+  if (!fam) return [];
+  return [fam.husb, fam.wife].filter(Boolean).map(personById).filter(Boolean);
 }
-function getMother(id) {
-  const ps = getParents(id);
-  return ps.find(isFemale) || ps[1] || null;
-}
-function getChildren(id) {
+function childrenOf(p) {
+  const fams = familiesOf(p);
   const out = [];
-  for (const pid of allIds()) {
-    const p = person(pid);
-    if ((p.parents || []).includes(id)) out.push(p);
-  }
+  fams.forEach(f => (f.children || []).forEach(cid => {
+    const c = personById(cid);
+    if (c) out.push(c);
+  }));
   return out;
 }
-function getSiblings(id) {
-  const p = person(id);
-  if (!p || !(p.parents && p.parents.length)) return [];
-  const parents = new Set(p.parents);
-  return allIds()
-    .filter(pid => pid !== id)
-    .map(person)
-    .filter(o => (o.parents || []).some(x => parents.has(x)));
+function spousesOf(p) {
+  return familiesOf(p).map(f => f.husb === p.id ? personById(f.wife) : personById(f.husb)).filter(Boolean);
 }
-function getSpouses(id) {
-  const p = person(id);
-  if (!p) return [];
-  return (p.spouses || []).map(person).filter(Boolean);
-}
-function getGrandparents(id) {
-  const ps = getParents(id);
-  return ps.flatMap(p => getParents(p.id));
-}
-function getSiblingsHalf(id, sharedParent) {
-  const p = person(id);
-  if (!p) return [];
-  return allIds()
-    .filter(pid => pid !== id)
-    .map(person)
-    .filter(o => (o.parents || []).includes(sharedParent));
-}
-function genLabel(p) {
-  if (!p.birth || !p.birth.year) return '?';
-  const years = allIds().map(id => person(id).birth?.year).filter(Boolean);
-  const minYear = Math.min(...years);
-  return Math.floor((p.birth.year - minYear) / 30) + 1;
+function genOf(p, seen) {
+  seen = seen || new Set();
+  if (seen.has(p.id)) return 0;
+  seen.add(p.id);
+  const pars = parentsOf(p);
+  if (!pars.length) return 0;
+  return 1 + Math.max(...pars.map(x => genOf(x, seen)));
 }
 
-/* 搜尋 */
-function search(q) {
-  if (!q) return [];
-  const lq = q.toLowerCase();
-  return allIds()
-    .map(person)
-    .filter(p => {
-      const blob = [p.name, p.nameEn, p.birthPlace, p.deathPlace, p.notes].join(' ').toLowerCase();
-      return blob.includes(lq);
-    });
+function lifeStatus(p) {
+  if (!p) return 'unknown';
+  if (p.death) return 'deceased';
+  return 'alive';
 }
 
-/* 載入與儲存 */
-async function loadData() {
-  const cached = localStorage.getItem(STORAGE_KEY);
-  if (cached) {
-    try {
-      DB = JSON.parse(cached);
-      return;
-    } catch (e) {}
-  }
-  const res = await fetch('data/demo.json');
-  DB = await res.json();
-  saveData();
-}
-function saveData() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
-}
-function resetToDemo() {
-  if (!confirm('確定要重置為範例資料嗎？這會覆蓋你目前的編輯。')) return;
-  fetch('data/demo.json').then(r => r.json()).then(d => {
-    DB = d; saveData(); toast('已重置為範例資料'); renderAll();
-  });
-}
-function clearAll() {
-  if (!confirm('確定要清空所有資料嗎？此操作無法復原。')) return;
-  DB = { _meta: { source: 'empty', version: 1, title: '族譜' }, people: {} };
-  saveData(); renderAll(); toast('已清空全部');
+/* ===== Family-origin heuristics ===== */
+function guessFamily(p) {
+  const bp = (p.birthplace || '').toLowerCase();
+  const caste = (p.caste || p.notes || '').toLowerCase();
+  if (caste.includes('原住民') || bp.includes('毛利') || bp.includes('maori') || bp.includes('new zealand')) return 'maori';
+  if (caste.includes('aboriginal') || bp.includes('aboriginal') || bp.includes('澳洲原住民')) return 'aboriginal';
+  if (caste.includes('scheduled tribe') || caste.includes('st') || bp.includes('tribal')) return 'indian_st';
+  if (caste.includes('scheduled caste') || caste.includes('sc') || caste.includes('dalit')) return 'indian_sc';
+  if (caste.includes('obc') || caste.includes('其他落後階級')) return 'indian_obc';
+  if (caste.includes('brahmin') || caste.includes('rajput') || caste.includes('kshatriya')) return 'indian_brahmin';
+  if (bp.includes('india') || bp.includes('pakistan') || bp.includes('bangladesh')) return 'indian_obc';
+  if (bp.includes('korea')) return 'korean';
+  if (bp.includes('japan')) return 'japanese';
+  if (bp.includes('vietnam')) return 'vietnamese';
+  if (bp.includes('thailand')) return 'thai';
+  if (bp.includes('france') || bp.includes('paris')) return 'european';
+  if (bp.includes('spain') || bp.includes('mexico') || bp.includes('argentina')) return 'hispanic';
+  if (bp.includes('africa')) return 'african';
+  if (bp.includes('australia') || bp.includes('new south wales')) return 'european';
+  if (bp.includes('taiwan')) return 'hakka';
+  if (caste.includes('客家') || bp.includes('meizhou') || bp.includes('客家')) return 'hakka';
+  if (caste.includes('回族') || bp.includes('ningxia') || bp.includes('回族')) return 'hui';
+  if (bp.includes('china') || bp.includes('beijing') || bp.includes('shanghai') || bp.includes('fujian')) return 'han';
+  return 'han';
 }
 
-/* 路由 */
-function setView(name) {
-  STATE.view = name;
-  $$('.view').forEach(v => v.classList.remove('active'));
-  $$('.navbtn').forEach(b => b.classList.remove('active'));
-  $(`#view${name[0].toUpperCase()+name.slice(1)}`)?.classList.add('active');
-  $(`.navbtn[data-view="${name}"]`)?.classList.add('active');
-  if (name === 'tree') renderTree();
-  if (name === 'list') renderList();
-  if (name === 'timeline') renderTimeline();
-}
-function setTreeRoot(id) {
-  STATE.tree.rootId = id;
-  if (STATE.view === 'tree') renderTree();
+const FAMILY_PALETTE = {
+  han:        { skin:'#f1c9a5', hair:'#1a1a1a' },
+  hakka:      { skin:'#e8b58e', hair:'#0d0d0d' },
+  hui:        { skin:'#dca478', hair:'#000000' },
+  korean:     { skin:'#f3d0a9', hair:'#1a1a1a' },
+  japanese:   { skin:'#f0cba0', hair:'#0a0a0a' },
+  vietnamese: { skin:'#e8b58e', hair:'#1a1a1a' },
+  thai:       { skin:'#d99b6a', hair:'#1a1a1a' },
+  european:   { skin:'#f4d0b0', hair:'#6b3a1d' },
+  hispanic:   { skin:'#c98a5f', hair:'#1a1a1a' },
+  african:    { skin:'#7a4a2a', hair:'#0a0a0a' },
+  indian_brahmin:{ skin:'#dca478', hair:'#1a1a1a' },
+  indian_obc: { skin:'#a86a3f', hair:'#1a1a1a' },
+  indian_sc:  { skin:'#8b5a3c', hair:'#1a1a1a' },
+  indian_st:  { skin:'#7a4a2a', hair:'#0a0a0a' },
+  maori:      { skin:'#a87148', hair:'#1a1a1a' },
+  aboriginal: { skin:'#8b5a3c', hair:'#0a0a0a' }
+};
+
+/* ===== SVG pixel portrait ===== */
+function pixelPortraitSVG(p, age, sex) {
+  age = age || 30;
+  sex = sex || p.sex || 'U';
+  const fam = guessFamily(p);
+  const pal = FAMILY_PALETTE[fam] || FAMILY_PALETTE.han;
+  const stage = age < 3 ? 'baby' : age < 13 ? 'child' : age < 20 ? 'teen' : age < 60 ? 'adult' : 'elder';
+  const skin = pal.skin, hair = pal.hair;
+  const isF = sex === 'F';
+  const headRX = stage === 'baby' ? 14 : stage === 'child' ? 16 : 18;
+  const skinDark = age > 70 ? '#888' : 'transparent';
+  return `
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" class="px-portrait">
+  <rect width="64" height="64" fill="#f8f4ea"/>
+  ${stage !== 'baby' ? `<rect x="8" y="44" width="48" height="20" fill="${isF?'#a04060':'#405070'}" rx="3"/>` : ''}
+  ${stage === 'baby' ? `<rect x="20" y="40" width="24" height="20" fill="#e8c4a0" rx="6"/>` : ''}
+  <ellipse cx="32" cy="30" rx="${headRX}" ry="${headRX+2}" fill="${skin}" stroke="${skinDark}" stroke-width="${age>70?1:0}"/>
+  ${stage !== 'baby' ? `<path d="M${32-headRX} 28 Q32 ${14-headRX/2} ${32+headRX} 28 L${32+headRX-2} ${30-headRX/2} Q32 ${16} ${32-headRX+2} ${30-headRX/2} Z" fill="${hair}"/>` : `<circle cx="20" cy="22" r="3" fill="${hair}"/><circle cx="44" cy="22" r="3" fill="${hair}"/>`}
+  ${isF && stage !== 'baby' && stage !== 'child' ? `<rect x="${32-headRX-1}" y="${30-headRX/2}" width="${headRX*2+2}" height="${headRX}" fill="${hair}" opacity="0.8"/>` : ''}
+  ${age < 3
+    ? `<circle cx="26" cy="32" r="1.8" fill="#222"/><circle cx="38" cy="32" r="1.8" fill="#222"/><path d="M28 40 Q32 42 36 40" stroke="#a04040" stroke-width="1.2" fill="none"/>`
+    : age > 70
+    ? `<path d="M25 33 L29 33" stroke="#222" stroke-width="1.5"/><path d="M35 33 L39 33" stroke="#222" stroke-width="1.5"/><path d="M28 40 L36 40" stroke="#a04040" stroke-width="1.2"/>`
+    : `<circle cx="26" cy="32" r="2" fill="#222"/><circle cx="38" cy="32" r="2" fill="#222"/><path d="M28 40 Q32 42 36 40" stroke="#a04040" stroke-width="1.2" fill="none"/>`}
+</svg>`;
 }
 
-/* Toast */
-let toastTimer = null;
-function toast(msg, ms=2200) {
-  const el = $('#toast');
-  el.textContent = msg;
-  el.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, ms);
-}
-
-/* === 族譜樹 === */
-function renderTree() {
-  const canvas = $('#treeCanvas');
-  canvas.innerHTML = '';
-  const sel = $('#treeRoot');
-  if (sel.children.length === 0) {
-    const sorted = allIds().map(person).sort((a, b) => (a.birth?.year || 9999) - (b.birth?.year || 9999));
-    for (const p of sorted) {
-      const opt = document.createElement('option');
-      opt.value = p.id;
-      opt.textContent = `${p.name}${p.birth?.year ? ' ('+p.birth.year+')' : ''}`;
-      sel.appendChild(opt);
+/* ===== Tree rendering ===== */
+function buildAncestorTree(rootId, depth) {
+  const root = personById(rootId);
+  if (!root) return null;
+  const visit = (pid, d) => {
+    const p = personById(pid);
+    if (!p) return null;
+    const node = { id: p.id, person: p, gen: depth - d, kids: [] };
+    if (d > 0) {
+      const pars = parentsOf(p);
+      pars.forEach(par => {
+        const child = visit(par.id, d-1);
+        if (child) node.kids.push(child);
+      });
     }
-  }
-  if (!STATE.tree.rootId) STATE.tree.rootId = allIds()[0];
-  if (STATE.tree.rootId) sel.value = STATE.tree.rootId;
-  if (!person(STATE.tree.rootId)) {
-    canvas.innerHTML = '<div class="tree-empty">請選擇一個人物作為中心</div>';
-    return;
-  }
-
-  const mode = STATE.tree.mode;
-  const gen = STATE.tree.gen;
-  if (mode === 'ancestor') renderAncestorTree(canvas, STATE.tree.rootId, gen);
-  else if (mode === 'descendant') renderDescendantTree(canvas, STATE.tree.rootId, gen);
-  else renderBothTree(canvas, STATE.tree.rootId, gen);
-}
-
-function getAncestorLayout(rootId, maxGen) {
-  const nodes = [];
-  const linkParentChild = [];
-  function recurse(id, gen, xSlot) {
-    if (!id) return;
-    if (gen > maxGen) return;
-    if (nodes.find(n => n.id === id)) return;
-    nodes.push({ id, gen, xSlot });
-    if (gen < maxGen) {
-      const ps = getParents(id);
-      const slotWidth = Math.pow(2, maxGen - gen - 1);
-      recurse(ps[0] ? ps[0].id : null, gen + 1, xSlot);
-      recurse(ps[1] ? ps[1].id : null, gen + 1, xSlot + slotWidth);
-      if (ps[0]) linkParentChild.push([{gen: gen+1, xSlot: xSlot}, {gen, xSlot}]);
-      if (ps[1]) linkParentChild.push([{gen: gen+1, xSlot: xSlot + slotWidth}, {gen, xSlot}]);
-    }
-  }
-  recurse(rootId, 0, Math.pow(2, maxGen) / 2 - 0.5);
-  return { nodes, linkParentChild, totalSlots: Math.pow(2, maxGen) };
-}
-
-function renderAncestorTree(canvas, rootId, maxGen) {
-  const layout = getAncestorLayout(rootId, maxGen);
-  const slots = layout.totalSlots;
-  const slotW = 200;
-  const rowH = 120;
-  const marginX = 30;
-  const marginY = 30;
-  const w = marginX * 2 + slots * slotW;
-  const h = marginY * 2 + (maxGen + 1) * rowH;
-  const svg = svgEl('svg', { viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: 'xMidYMid meet', width: '100%' });
-  for (const [from, to] of layout.linkParentChild) {
-    if (!layout.nodes.find(n => n.xSlot === to.xSlot && n.gen === to.gen)) continue;
-    if (!layout.nodes.find(n => n.xSlot === from.xSlot && n.gen === from.gen)) continue;
-    const fx = marginX + from.xSlot * slotW + slotW / 2;
-    const fy = marginY + from.gen * rowH + 40;
-    const tx = marginX + to.xSlot * slotW + slotW / 2;
-    const ty = marginY + to.gen * rowH + 90;
-    svgEl('path', {
-      d: `M ${fx} ${fy} L ${fx} ${fy + (ty - fy) / 2} L ${tx} ${fy + (ty - fy) / 2} L ${tx} ${ty}`,
-      class: 'tree-link'
-    }, svg);
-  }
-  for (const n of layout.nodes) {
-    const p = person(n.id);
-    if (!p) continue;
-    const x = marginX + n.xSlot * slotW;
-    const y = marginY + n.gen * rowH;
-    drawPersonNode(svg, p, x, y, slotW - 8, 80, n.id === STATE.selectedId);
-  }
-  canvas.appendChild(svg);
-}
-
-function renderDescendantTree(canvas, rootId, maxGen) {
-  const nodes = [{ id: rootId, gen: 0 }];
-  const edges = [];
-  function recurse(id, gen) {
-    if (gen >= maxGen) return;
-    const kids = getChildren(id).sort((a, b) => {
-      if (a.gender !== b.gender) return a.gender === 'F' ? 1 : -1;
-      return (a.birth?.year || 0) - (b.birth?.year || 0);
-    });
-    for (const k of kids) {
-      nodes.push({ id: k.id, gen: gen + 1 });
-      edges.push({ parentId: id, childId: k.id });
-      recurse(k.id, gen + 1);
-    }
-  }
-  recurse(rootId, 0);
-  const genCounts = [];
-  for (let g = 0; g <= maxGen; g++) {
-    genCounts.push(nodes.filter(n => n.gen === g).length);
-  }
-  const maxInGen = Math.max(...genCounts, 1);
-  const slotW = 220;
-  const rowH = 110;
-  const marginX = 30;
-  const marginY = 30;
-  const totalW = marginX * 2 + maxInGen * slotW;
-  const totalH = marginY * 2 + (maxGen + 1) * rowH;
-  const genOffsets = [];
-  for (let g = 0; g <= maxGen; g++) {
-    const count = genCounts[g];
-    genOffsets.push((maxInGen - count) * slotW / 2);
-  }
-  const nodePos = {};
-  for (let g = 0; g <= maxGen; g++) {
-    const inGen = nodes.filter(n => n.gen === g);
-    inGen.forEach((n, i) => {
-      nodePos[n.id] = { x: marginX + genOffsets[g] + i * slotW, y: marginY + g * rowH };
-    });
-  }
-  const spouseEdges = [];
-  for (const n of nodes) {
-    const p = person(n.id);
-    if (!p) continue;
-    for (const sp of p.spouses || []) {
-      if (nodePos[sp] && !spouseEdges.find(e => (e.a === sp && e.b === n.id))) {
-        spouseEdges.push({ a: n.id, b: sp });
-      }
-    }
-  }
-  const svg = svgEl('svg', { viewBox: `0 0 ${totalW} ${totalH}`, preserveAspectRatio: 'xMidYMid meet', width: '100%' });
-  for (const e of edges) {
-    const a = nodePos[e.parentId], b = nodePos[e.childId];
-    if (!a || !b) continue;
-    const fx = a.x + slotW / 2, fy = a.y + 80;
-    const tx = b.x + slotW / 2, ty = b.y;
-    svgEl('path', {
-      d: `M ${fx} ${fy} L ${fx} ${fy + (ty - fy) / 2} L ${tx} ${fy + (ty - fy) / 2} L ${tx} ${ty}`,
-      class: 'tree-link'
-    }, svg);
-  }
-  for (const e of spouseEdges) {
-    const a = nodePos[e.a], b = nodePos[e.b];
-    if (!a || !b) continue;
-    svgEl('line', {
-      x1: a.x + slotW, y1: a.y + 40,
-      x2: b.x, y2: b.y + 40,
-      class: 'tree-link spouse'
-    }, svg);
-  }
-  for (const n of nodes) {
-    const p = person(n.id);
-    if (!p) continue;
-    const pos = nodePos[n.id];
-    drawPersonNode(svg, p, pos.x, pos.y, slotW - 8, 80, n.id === STATE.selectedId);
-  }
-  canvas.appendChild(svg);
-}
-
-function renderBothTree(canvas, rootId, maxGen) {
-  const halfGen = Math.max(1, Math.floor(maxGen / 2));
-  renderAncestorTree(canvas, rootId, halfGen);
-}
-
-function drawPersonNode(svg, p, x, y, w, h, selected) {
-  const g = svgEl('g', { class: 'tree-node' + (selected ? ' selected' : '') + (isAlive(p) ? '' : ' deceased'), transform: `translate(${x}, ${y})` }, svg);
-  g.addEventListener('click', () => { STATE.selectedId = p.id; showPerson(p.id); });
-  const genderClass = isMale(p) ? 'node-m' : isFemale(p) ? 'node-f' : 'node-u';
-  const stroke = isMale(p) ? '#4a6da8' : isFemale(p) ? '#b86998' : '#c2b693';
-  const aliveOpacity = isAlive(p) ? 1 : 0.55;
-  svgEl('rect', {
-    class: 'node-rect ' + genderClass,
-    x: 0, y: 0, width: w, height: h,
-    rx: 8, ry: 8,
-    fill: '#faf6ec',
-    stroke: stroke,
-    'stroke-width': 1.5,
-    opacity: aliveOpacity,
-  }, g);
-  const nameY = 24;
-  const nameEl = svgEl('text', { class: 'node-name', x: 12, y: nameY, fill: '#2a2218' }, g);
-  nameEl.textContent = p.name;
-  if (p.nameEn) {
-    const en = svgEl('text', { class: 'node-en', x: 12, y: nameY + 16, fill: '#8b7e64' }, g);
-    en.textContent = p.nameEn;
-  }
-  const lifeY = h - 14;
-  const lifeText = `${fmtDate(p.birth)} – ${p.death ? fmtDate(p.death) : ''}`;
-  const life = svgEl('text', { class: 'node-life', x: 12, y: lifeY, fill: '#8b7e64' }, g);
-  life.textContent = lifeText;
-  svgEl('circle', { class: 'node-dot ' + genderClass, cx: w - 14, cy: 14, r: 5, fill: stroke, opacity: aliveOpacity }, g);
-}
-
-function svgEl(tag, attrs, parent) {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const k in attrs) {
-    if (Object.prototype.hasOwnProperty.call(attrs, k)) {
-      const v = attrs[k];
-      if (v !== undefined && v !== null) el.setAttribute(k, String(v));
-    }
-  }
-  if (parent) parent.appendChild(el);
-  return el;
-}
-
-/* === 名冊 === */
-function renderList() {
-  const container = $('#listContainer');
-  const q = ($('#listSearch').value || '').toLowerCase();
-  const sort = $('#listSort').value;
-  let list = allIds().map(person);
-  if (q) {
-    list = list.filter(p => {
-      const blob = [p.name, p.nameEn, p.birthPlace, p.deathPlace, p.notes].join(' ').toLowerCase();
-      return blob.includes(q);
-    });
-  }
-  if (sort === 'name') {
-    list.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant'));
-  } else if (sort === 'birthAsc') {
-    list.sort((a, b) => (a.birth?.year || 9999) - (b.birth?.year || 9999));
-  } else if (sort === 'birthDesc') {
-    list.sort((a, b) => (b.birth?.year || 0) - (a.birth?.year || 0));
-  } else {
-    list.sort((a, b) => genLabel(a) - genLabel(b) || (a.birth?.year || 0) - (b.birth?.year || 0));
-  }
-  container.innerHTML = '';
-  if (list.length === 0) {
-    container.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--fg-3);">沒有符合的人</div>';
-    return;
-  }
-  for (const p of list) {
-    const card = document.createElement('div');
-    const classes = ['list-card', p.gender || 'U'];
-    if (!isAlive(p)) classes.push('deceased');
-    card.className = classes.join(' ');
-    card.innerHTML = `
-      <div class="lc-name">${escapeHtml(p.name)}${p.nameEn ? ` <span style="color:var(--fg-3);font-size:12px;font-weight:400;">${escapeHtml(p.nameEn)}</span>` : ''}</div>
-      <div class="lc-meta">${fmtDateRange(p)}${p.birthPlace ? ' · '+escapeHtml(p.birthPlace) : ''}</div>
-    `;
-    card.addEventListener('click', () => showPerson(p.id));
-    container.appendChild(card);
-  }
-}
-
-function escapeHtml(s) { return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-/* === 時間軸 === */
-function renderTimeline() {
-  const canvas = $('#tlCanvas');
-  canvas.innerHTML = '';
-  const mode = $('#tlMode').value;
-  const events = [];
-  for (const p of allIds().map(person)) {
-    if (p.birth?.year && (mode === 'birth' || mode === 'both')) {
-      events.push({ year: p.birth.year, type: 'birth', person: p });
-    }
-    if (p.death?.year && (mode === 'death' || mode === 'both')) {
-      events.push({ year: p.death.year, type: 'death', person: p });
-    }
-  }
-  events.sort((a, b) => a.year - b.year);
-  if (events.length === 0) {
-    canvas.innerHTML = '<div class="tree-empty">沒有事件</div>';
-    return;
-  }
-  let lastYear = -1;
-  for (const e of events) {
-    if (e.year !== lastYear) {
-      const yr = document.createElement('div');
-      yr.className = 'tl-row';
-      yr.innerHTML = `<div class="tl-year">${e.year}</div><div style="flex:1;display:flex;flex-direction:column;gap:2px;"></div>`;
-      canvas.appendChild(yr);
-      lastYear = e.year;
-    }
-    const lastRow = canvas.lastElementChild;
-    const container = lastRow.lastElementChild;
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:2px 0;';
-    row.innerHTML = `
-      <span class="tl-dot ${e.type}"></span>
-      <span class="tl-name">${escapeHtml(e.person.name)}</span>
-      <span style="color:var(--fg-3);font-size:12px;">${e.type === 'birth' ? '出生' : '逝世'}</span>
-    `;
-    row.querySelector('.tl-name').addEventListener('click', () => showPerson(e.person.id));
-    container.appendChild(row);
-  }
-}
-
-/* === 人物詳情 === */
-function showPerson(id) {
-  const p = person(id);
-  if (!p) return;
-  STATE.selectedId = id;
-  $('#pmTitle').textContent = p.name;
-  const body = $('#pmBody');
-  body.innerHTML = '';
-  const sec1 = document.createElement('div');
-  sec1.className = 'pm-section';
-  sec1.innerHTML = `<h4>基本資料</h4>
-    <div class="pm-grid">
-      <div class="pm-kv"><span>性別</span><b>${p.gender === 'M' ? '男' : p.gender === 'F' ? '女' : '未知'}</b></div>
-      <div class="pm-kv"><span>享年</span><b>${ageAt(p) ?? '—'} ${!isAlive(p) ? '（已故）' : ''}</b></div>
-      <div class="pm-kv"><span>出生</span><b>${fmtDate(p.birth) || '—'}${p.birthPlace ? ' · '+escapeHtml(p.birthPlace) : ''}</b></div>
-      <div class="pm-kv"><span>逝世</span><b>${fmtDate(p.death) || '—'}${p.deathPlace ? ' · '+escapeHtml(p.deathPlace) : ''}</b></div>
-      <div class="pm-kv"><span>世代</span><b>第 ${genLabel(p)} 世</b></div>
-      <div class="pm-kv"><span>子女數</span><b>${getChildren(p.id).length}</b></div>
-    </div>
-    ${p.notes ? `<p style="margin-top:10px;color:var(--fg-2);font-size:14px;line-height:1.7;">${escapeHtml(p.notes)}</p>` : ''}
-  `;
-  body.appendChild(sec1);
-
-  const sec2 = document.createElement('div');
-  sec2.className = 'pm-section';
-  const rels = [];
-  const father = getFather(p.id), mother = getMother(p.id);
-  if (father) rels.push({ kind: 'father', label: '父', p: father });
-  if (mother) rels.push({ kind: 'mother', label: '母', p: mother });
-  for (const s of getSiblings(p.id)) rels.push({ kind: 'sibling', label: isMale(s) ? '兄弟' : '姊妹', p: s });
-  for (const sp of getSpouses(p.id)) rels.push({ kind: 'spouse', label: isMale(sp) ? '夫' : '妻', p: sp });
-  for (const c of getChildren(p.id)) rels.push({ kind: 'child', label: isMale(c) ? '子' : '女', p: c });
-  if (rels.length) {
-    sec2.innerHTML = `<h4>關係</h4><div class="pm-rels">${rels.map(r =>
-      `<span class="pm-rel ${r.kind}" data-id="${r.p.id}">${r.label} · ${escapeHtml(r.p.name)}</span>`
-    ).join('')}</div>`;
-    sec2.querySelectorAll('.pm-rel').forEach(el => {
-      el.addEventListener('click', () => { STATE.selectedId = el.dataset.id; showPerson(el.dataset.id); });
-    });
-    body.appendChild(sec2);
-  }
-
-  $('#personModal').hidden = false;
-  if (STATE.view === 'tree') renderTree();
-}
-
-function openEditModal(id) {
-  const isNew = !id;
-  const p = id ? person(id) : { id: null, name: '', nameEn: '', gender: 'M', birth: {}, death: {}, birthPlace: '', deathPlace: '', notes: '', parents: [], spouses: [] };
-  $('#emTitle').textContent = isNew ? '新增人物' : `編輯：${p.name}`;
-  $('#emForm').reset();
-  const allSorted = allIds().map(person).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant'));
-  const p1 = $('#emForm [name="parent1"]'), p2 = $('#emForm [name="parent2"]');
-  p1.innerHTML = '<option value="">— 無 —</option>' + allSorted.map(o => `<option value="${o.id}">${escapeHtml(o.name)}</option>`).join('');
-  p2.innerHTML = '<option value="">— 無 —</option>' + allSorted.map(o => `<option value="${o.id}">${escapeHtml(o.name)}</option>`).join('');
-  const sp = $('#emForm [name="spouses"]');
-  sp.innerHTML = allSorted.map(o => `<option value="${o.id}">${escapeHtml(o.name)}</option>`).join('');
-  if (!isNew) {
-    const f = $('#emForm');
-    f.name.value = p.name || '';
-    f.nameEn.value = p.nameEn || '';
-    f.gender.value = p.gender || 'M';
-    f.birthYear.value = p.birth?.year || '';
-    f.birthMonth.value = p.birth?.month || '';
-    f.birthDay.value = p.birth?.day || '';
-    f.birthPlace.value = p.birthPlace || '';
-    f.deathYear.value = p.death?.year || '';
-    f.deathMonth.value = p.death?.month || '';
-    f.deathDay.value = p.death?.day || '';
-    f.deathPlace.value = p.deathPlace || '';
-    f.notes.value = p.notes || '';
-    if (p.parents?.[0]) p1.value = p.parents[0];
-    if (p.parents?.[1]) p2.value = p.parents[1];
-    for (const s of (p.spouses || [])) {
-      const opt = Array.from(sp.options).find(o => o.value === s);
-      if (opt) opt.selected = true;
-    }
-  }
-  if (id) {
-    [p1, p2, sp].forEach(sel => {
-      const opt = sel.querySelector(`option[value="${id}"]`);
-      if (opt) opt.remove();
-    });
-  }
-  $('#editModal').dataset.editId = id || '';
-  $('#editModal').hidden = false;
-}
-
-function savePerson(e) {
-  e.preventDefault();
-  const f = $('#emForm');
-  const id = $('#editModal').dataset.editId;
-  const data = {
-    name: f.name.value.trim(),
-    nameEn: f.nameEn.value.trim(),
-    gender: f.gender.value,
-    birth: f.birthYear.value ? { year: +f.birthYear.value, month: +f.birthMonth.value || null, day: +f.birthDay.value || null } : null,
-    death: f.deathYear.value ? { year: +f.deathYear.value, month: +f.deathMonth.value || null, day: +f.deathDay.value || null } : null,
-    birthPlace: f.birthPlace.value.trim(),
-    deathPlace: f.deathPlace.value.trim(),
-    notes: f.notes.value.trim(),
-    parents: [f.parent1.value, f.parent2.value].filter(Boolean),
-    spouses: Array.from(f.spouses.selectedOptions).map(o => o.value),
+    return node;
   };
-  if (!data.name) { toast('請填姓名'); return; }
-  let newId = id;
-  if (id) {
-    Object.assign(person(id), data);
-  } else {
-    newId = 'p' + Date.now();
-    data.id = newId;
-    DB.people[newId] = data;
-  }
-  for (const spId of data.spouses) {
-    const sp = person(spId);
-    if (sp && !sp.spouses.includes(newId)) sp.spouses.push(newId);
-  }
-  if (id) {
-    const old = person(id);
-    for (const spId of (old?.spouses || [])) {
-      if (!data.spouses.includes(spId)) {
-        const sp = person(spId);
-        if (sp) sp.spouses = sp.spouses.filter(x => x !== id);
-      }
+  return visit(rootId, depth);
+}
+
+function buildDescendantTree(rootId, depth) {
+  const visit = (pid, d) => {
+    const p = personById(pid);
+    if (!p) return null;
+    const node = { id: p.id, person: p, gen: d, kids: [] };
+    if (d < depth) {
+      childrenOf(p).forEach(c => {
+        const child = visit(c.id, d+1);
+        if (child) node.kids.push(child);
+      });
     }
-  }
-  saveData();
-  $('#editModal').hidden = true;
-  $('#personModal').hidden = true;
-  STATE.selectedId = newId;
-  toast(id ? '已更新' : '已新增');
-  renderAll();
-}
-
-function deletePerson(id) {
-  if (!confirm(`刪除「${person(id)?.name}」？此操作無法復原。`)) return;
-  for (const spId of person(id).spouses || []) {
-    const sp = person(spId);
-    if (sp) sp.spouses = sp.spouses.filter(x => x !== id);
-  }
-  for (const pid of allIds()) {
-    const p = person(pid);
-    if (p.parents) p.parents = p.parents.filter(x => x !== id);
-  }
-  delete DB.people[id];
-  saveData();
-  $('#personModal').hidden = true;
-  toast('已刪除');
-  renderAll();
-}
-
-/* === GEDCOM === */
-function exportGedcom() {
-  if (!window.Gedcom) { toast('GEDCOM 模組未載入'); return; }
-  const ged = window.Gedcom.export(DB);
-  const blob = new Blob([ged], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${DB._meta?.title || 'zu-pu'}.ged`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  setIoMsg(`已匯出 ${allIds().length} 人`, 'ok');
-}
-
-function importGedcom(file) {
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    try {
-      const text = e.target.result;
-      if (!window.Gedcom) { setIoMsg('GEDCOM 模組未載入', 'err'); return; }
-      const result = window.Gedcom.import(text);
-      if (!result || !result.people) { setIoMsg('檔案無法解析', 'err'); return; }
-      if (!confirm(`偵測到 ${Object.keys(result.people).length} 人。匯入將覆蓋目前資料，確定？`)) return;
-      DB = { _meta: { source: 'gedcom', version: 1, title: result.title || '匯入族譜' }, people: result.people };
-      saveData();
-      setIoMsg(`成功匯入 ${Object.keys(DB.people).length} 人`, 'ok');
-      renderAll();
-    } catch (err) {
-      console.error(err);
-      setIoMsg('匯入失敗：' + err.message, 'err');
-    }
+    return node;
   };
-  reader.readAsText(file);
-}
-function setIoMsg(msg, kind) {
-  const el = $('#ioMsg');
-  el.textContent = msg;
-  el.className = 'io-msg' + (kind ? ' ' + kind : '');
+  return visit(rootId, 0);
 }
 
-/* === wire === */
-function wire() {
-  $$('.navbtn').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
-  $('#treeRoot').addEventListener('change', e => setTreeRoot(e.target.value));
-  $$('.seg[data-group="treeMode"] .seg-btn').forEach(b => b.addEventListener('click', () => {
-    $$('.seg[data-group="treeMode"] .seg-btn').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    STATE.tree.mode = b.dataset.val;
-    renderTree();
-  }));
-  $$('.seg[data-group="treeGen"] .seg-btn').forEach(b => b.addEventListener('click', () => {
-    $$('.seg[data-group="treeGen"] .seg-btn').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    STATE.tree.gen = +b.dataset.val;
-    renderTree();
-  }));
-  $('#listSearch').addEventListener('input', renderList);
-  $('#listSort').addEventListener('change', renderList);
-  $('#tlMode').addEventListener('change', renderTimeline);
+function renderTreeSVG(treeRoot, mode) {
+  if (!treeRoot) return '<p class="muted">—</p>';
+  const width = mode === 'both' ? 1100 : 900;
+  const rowH = 90;
+  const positions = [];
+  function layout(node, x, y) {
+    positions.push({ node, x, y });
+    if (!node.kids.length) return x;
+    let cur = x;
+    node.kids.forEach(k => {
+      cur = layout(k, cur, y + rowH);
+      cur += 30;
+    });
+    return cur - 30;
+  }
+  layout(treeRoot, 0, 0);
+  const maxX = Math.max(...positions.map(p => p.x));
+  const maxY = Math.max(...positions.map(p => p.y));
+  const cols = maxX + 220;
+  const rows = maxY + 80;
+  let svg = `<svg viewBox="0 0 ${cols} ${rows}" xmlns="http://www.w3.org/2000/svg" class="tree-svg">`;
+  positions.forEach(({ node, x, y }) => {
+    node.kids.forEach(k => {
+      const childPos = positions.find(p => p.node.id === k.id);
+      if (childPos) {
+        svg += `<line x1="${x+60}" y1="${y+50}" x2="${childPos.x+60}" y2="${childPos.y+50}" stroke="#888" stroke-width="1.5"/>`;
+      }
+    });
+  });
+  positions.forEach(({ node, x, y }) => {
+    const p = node.person;
+    const age = computeAge(p);
+    const sex = p.sex || 'U';
+    const deceased = lifeStatus(p) === 'deceased';
+    svg += `<g transform="translate(${x}, ${y})">`;
+    svg += `<rect class="node-rect node-${sexLower(sex)} ${deceased?'node-deceased':''}" x="0" y="0" width="160" height="80" rx="6"/>`;
+    svg += `<foreignObject x="4" y="4" width="48" height="48">${pixelPortraitSVG(p, age, sex)}</foreignObject>`;
+    svg += `<text x="58" y="22" class="node-name">${escapeXml(p.name || '?')}</text>`;
+    svg += `<text x="58" y="40" class="node-meta">${p.birth || ''} – ${p.death || t('legend.m')} · ${t('sex.' + sexLower(sex))}</text>`;
+    svg += `<text x="58" y="56" class="node-gen">${t('tree.g2').replace('{0}', node.gen+1)}</text>`;
+    if (deceased) svg += `<text x="148" y="14" class="node-cross">†</text>`;
+    svg += `</g>`;
+  });
+  svg += `</svg>`;
+  return svg;
+}
 
-  $('#btnSearch').addEventListener('click', () => {
-    $('#searchInput').value = '';
-    $('#searchResults').innerHTML = '';
-    $('#searchModal').hidden = false;
-    $('#searchInput').focus();
-  });
-  $('#searchInput').addEventListener('input', (e) => {
-    const q = e.target.value.trim();
-    const res = search(q);
-    const cont = $('#searchResults');
-    if (!q) { cont.innerHTML = ''; return; }
-    cont.innerHTML = res.slice(0, 30).map(p =>
-      `<span class="pm-rel" data-id="${p.id}">${escapeHtml(p.name)}${p.birth?.year ? ' ('+p.birth.year+')' : ''}${p.notes ? ' — '+escapeHtml(p.notes.slice(0,30)) : ''}</span>`
-    ).join('') || '<div style="color:var(--fg-3);padding:8px;">沒有符合</div>';
-    cont.querySelectorAll('.pm-rel').forEach(el => el.addEventListener('click', () => {
-      $('#searchModal').hidden = true;
-      showPerson(el.dataset.id);
-    }));
-  });
-  $('#searchClose').addEventListener('click', () => $('#searchModal').hidden = true);
+function sexLower(s) { return s === 'M' ? 'm' : s === 'F' ? 'f' : 'u'; }
 
-  $('#btnAdd').addEventListener('click', () => openEditModal(null));
-  $('#pmEdit').addEventListener('click', () => {
-    if (!STATE.selectedId) return;
-    openEditModal(STATE.selectedId);
-  });
-  $('#pmDelete').addEventListener('click', () => {
-    if (STATE.selectedId) deletePerson(STATE.selectedId);
-  });
-  $('#pmClose').addEventListener('click', () => $('#personModal').hidden = true);
-  $('#emCancel').addEventListener('click', () => $('#editModal').hidden = true);
-  $('#emForm').addEventListener('submit', savePerson);
+function escapeXml(s) {
+  return String(s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[c]));
+}
 
-  $('#btnIO').addEventListener('click', () => { $('#ioModal').hidden = false; $('#ioMsg').textContent = ''; });
-  $('#ioClose').addEventListener('click', () => $('#ioModal').hidden = true);
-  $('#btnImport').addEventListener('click', () => $('#fileImport').click());
-  $('#fileImport').addEventListener('change', (e) => {
-    if (e.target.files[0]) importGedcom(e.target.files[0]);
-  });
-  $('#btnExport').addEventListener('click', exportGedcom);
-  $('#btnReset').addEventListener('click', resetToDemo);
-  $('#btnClear').addEventListener('click', clearAll);
+function computeAge(p) {
+  if (!p.birth) return 30;
+  const by = parseInt(p.birth.slice(0,4));
+  const ey = p.death ? parseInt(p.death.slice(0,4)) : new Date().getFullYear();
+  return Math.max(0, ey - by);
+}
 
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      $$('.modal').forEach(m => m.hidden = true);
+/* ===== Person detail card ===== */
+function personCard(p) {
+  const age = computeAge(p);
+  const sex = p.sex || 'U';
+  const deceased = lifeStatus(p) === 'deceased';
+  const fam = guessFamily(p);
+  return `
+<article class="person-card">
+  <div class="person-portrait">${pixelPortraitSVG(p, age, sex)}</div>
+  <h3 class="person-name">${escapeXml(p.name || '?')}</h3>
+  <p class="person-meta">
+    <span class="badge badge-${sexLower(sex)}">${t('sex.' + sexLower(sex))}</span>
+    ${deceased ? `<span class="badge badge-deceased">${t('legend.d')}</span>` : `<span class="badge badge-alive">${t('legend.m')}</span>`}
+    <span class="badge badge-fam">${fam}</span>
+  </p>
+  <ul class="person-fields">
+    ${p.birth ? `<li><b>${t('event.birth')}:</b> ${escapeXml(p.birth)}</li>` : ''}
+    ${p.death ? `<li><b>${t('event.death')}:</b> ${escapeXml(p.death)}</li>` : ''}
+    ${p.birthplace ? `<li><b>${t('event.birthplace')}:</b> ${escapeXml(p.birthplace)}</li>` : ''}
+    ${p.occupation ? `<li><b>${t('event.occupation')}:</b> ${escapeXml(p.occupation)}</li>` : ''}
+    ${p.education ? `<li><b>${t('event.education')}:</b> ${escapeXml(p.education)}</li>` : ''}
+    ${p.caste ? `<li><b>${t('event.caste')}:</b> ${escapeXml(p.caste)}</li>` : ''}
+    ${p.notes ? `<li><b>${t('event.notes')}:</b> ${escapeXml(p.notes)}</li>` : ''}
+  </ul>
+</article>`;
+}
+
+/* ===== Lab mode ===== */
+function runLab() {
+  const ps = STATE.people;
+  if (!ps.length) return { total: 0, avgAge: 0, avgGen: 0, maxGen: 0, byDecade: [] };
+  const total = ps.length;
+  let ageSum = 0, ageN = 0;
+  const seen = new Set();
+  const gens = ps.map(p => genOf(p, seen));
+  const maxGen = Math.max(0, ...gens);
+  const avgGen = gens.reduce((a,b)=>a+b,0) / gens.length;
+  ps.forEach(p => {
+    const a = computeAge(p);
+    if (!isNaN(a) && a > 0) { ageSum += a; ageN++; }
+  });
+  const avgAge = ageN ? ageSum / ageN : 0;
+  const bins = {};
+  ps.forEach(p => {
+    const by = parseInt((p.birth||'').slice(0,4));
+    if (!isNaN(by)) {
+      const decade = Math.floor(by/10)*10;
+      bins[decade] = (bins[decade]||0) + 1;
     }
   });
+  const byDecade = Object.keys(bins).sort().map(d => ({ decade: parseInt(d), n: bins[d] }));
+  return { total, avgAge, avgGen, maxGen, byDecade };
 }
 
+function renderLab() {
+  const wrap = $('#lab-results');
+  if (!wrap) return;
+  const r = runLab();
+  if (!r.total) { wrap.innerHTML = `<p class="muted">—</p>`; return; }
+  const maxBar = Math.max(...r.byDecade.map(b => b.n), 1);
+  let html = `<div class="lab-stats">
+    <div class="lab-stat"><b>${r.total}</b><span>${t('lab.total')}</span></div>
+    <div class="lab-stat"><b>${r.avgAge.toFixed(1)}</b><span>${t('lab.avgAge')}</span></div>
+    <div class="lab-stat"><b>${r.avgGen.toFixed(2)}</b><span>${t('lab.avgGen')}</span></div>
+    <div class="lab-stat"><b>${r.maxGen+1}</b><span>${t('lab.maxGen')}</span></div>
+  </div>`;
+  if (r.byDecade.length) {
+    html += `<div class="lab-section"><h3>${t('lab.byDecade')}</h3><div class="lab-bars">`;
+    r.byDecade.forEach(b => {
+      const h = Math.round((b.n / maxBar) * 80);
+      html += `<div class="lab-bar-col"><div class="lab-bar" style="height:${h}px"></div><div class="lab-bar-label">${b.decade}s</div><div class="lab-bar-n">${b.n}</div></div>`;
+    });
+    html += `</div></div>`;
+  }
+  wrap.innerHTML = html;
+}
+
+/* ===== View switching ===== */
+function showView(name) {
+  ['tree','people','person','lab'].forEach(v => {
+    const el = $('#view' + v.charAt(0).toUpperCase() + v.slice(1));
+    if (el) el.style.display = (v === name) ? 'block' : 'none';
+  });
+  $$('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+}
+
+/* ===== Pick a sensible default tree root ===== */
+function defaultTreeRoot() {
+  const withFamily = STATE.people.find(p => parentsOf(p).length && childrenOf(p).length);
+  if (withFamily) return withFamily.id;
+  return STATE.people[0]?.id;
+}
+
+/* ===== Render everything ===== */
 function renderAll() {
-  if (STATE.tree.rootId && !person(STATE.tree.rootId)) {
-    STATE.tree.rootId = allIds()[0] || null;
-  }
-  $('#treeRoot').innerHTML = '';
+  $$('[data-t]').forEach(el => {
+    const k = el.getAttribute('data-t');
+    el.textContent = t(k);
+  });
+  $$('[data-t-placeholder]').forEach(el => {
+    const k = el.getAttribute('data-t-placeholder');
+    el.setAttribute('placeholder', t(k));
+  });
+  const sel = $('#langSelect');
+  if (sel) sel.value = LANG;
+
+  renderPeopleList();
   renderTree();
-  if (STATE.view === 'list') renderList();
-  if (STATE.view === 'timeline') renderTimeline();
-  if (STATE.selectedId && !person(STATE.selectedId)) {
-    $('#personModal').hidden = true;
+  renderLab();
+}
+
+function renderPeopleList() {
+  const wrap = $('#peopleList');
+  if (!wrap) return;
+  if (!STATE.people.length) { wrap.innerHTML = `<p class="muted">—</p>`; return; }
+  wrap.innerHTML = STATE.people.map(p => {
+    const age = computeAge(p);
+    const deceased = lifeStatus(p) === 'deceased';
+    return `<div class="person-row" data-id="${p.id}">
+      <div class="row-portrait">${pixelPortraitSVG(p, age, p.sex || 'U')}</div>
+      <div class="row-meta">
+        <div class="row-name">${escapeXml(p.name || '?')} <span class="row-sex">[${t('sex.' + sexLower(p.sex || 'U'))}]</span> ${deceased ? '†' : ''}</div>
+        <div class="row-life">${p.birth||'?'} – ${p.death || t('legend.m')}</div>
+      </div>
+    </div>`;
+  }).join('');
+  $$('#peopleList .person-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.dataset.id;
+      const p = personById(id);
+      $('#personCardWrap').innerHTML = p ? personCard(p) : '';
+      showView('person');
+    });
+  });
+}
+
+function renderTree() {
+  const wrap = $('#treeSvg');
+  if (!wrap) return;
+  const rootSel = $('#treeRoot');
+  const modeSel = $('#treeMode');
+  const depthSel = $('#treeDepth');
+  if (!rootSel) return;
+  if (rootSel.options.length !== STATE.people.length) {
+    rootSel.innerHTML = STATE.people.map(p => `<option value="${p.id}">${escapeXml(p.name || '?')}</option>`).join('');
+    const def = defaultTreeRoot();
+    if (def) rootSel.value = def;
+  }
+  const rid = rootSel.value;
+  const mode = modeSel ? modeSel.value : 'descendant';
+  const depth = depthSel ? parseInt(depthSel.value) : 3;
+  let tree;
+  if (mode === 'ancestor') tree = buildAncestorTree(rid, depth);
+  else if (mode === 'both') tree = buildAncestorTree(rid, depth);
+  else tree = buildDescendantTree(rid, depth);
+  wrap.innerHTML = renderTreeSVG(tree, mode);
+}
+
+/* ===== Events ===== */
+function bindUI() {
+  $('#langSelect')?.addEventListener('change', e => setLang(e.target.value));
+  $$('.tab-btn').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
+  $('#treeRoot')?.addEventListener('change', renderTree);
+  $('#treeMode')?.addEventListener('change', renderTree);
+  $('#treeDepth')?.addEventListener('change', renderTree);
+  $('#labRun')?.addEventListener('click', renderLab);
+}
+
+/* ===== Init ===== */
+async function loadDemo() {
+  try {
+    const res = await fetch('data/demo.json');
+    const data = await res.json();
+    STATE.people = data.people || [];
+    STATE.families = data.families || [];
+    STATE.meta = data.meta || { root: null, name: '' };
+  } catch (e) {
+    console.warn('demo.json load failed', e);
   }
 }
 
-async function init() {
-  await loadData();
-  wire();
-  setView('tree');
-}
-init();
+(async function init() {
+  await loadI18n();
+  LANG = detectLang();
+  await loadDemo();
+  bindUI();
+  renderAll();
+})();
+
+window.zuPu = { setLang, STATE, t, runLab };
